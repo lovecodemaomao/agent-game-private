@@ -4,15 +4,14 @@ from .geography import INF
 from .protocol import distance
 
 ORES=('stone','iron','copper')
-SUMMON_ORDER='LargeRobotSummonOrder'      # 大机器人召唤令(需求: 第一天金钱>100优先购买)
+SUMMON_ORDER='LargeRobotSummonOrder'      # 第3天起、防线达标后才采购
 SUMMON_ORDER_TRIGGER=100
-RETURN_MARGIN=5                           # 与 brain.RETURN_MARGIN 保持一致
+JOURNEY_MARGIN=5                          # 采购/采矿完整行程的保守余量
 HARVEST_BUFFER=2                          # 顺手采集只留 2 回合缓冲（返程已在 margin 内）
 NEAR_HOME_RADIUS=4                        # "家附近"判定半径（基地切比雪夫距离）
 HARVEST_DETOUR=2                          # 顺路判据: 多绕不超过 2 回合即视为顺手
-NIGHT_OVERRUN=12                          # 保留: 长差事允许的入夜余量
 WALL_FIXER_RESERVE=3                      # 常备修复包数量上限
-# 每日配额: 每天先围墙后武器, 满足当天目标后有余钱才买修复包
+# 每日配额控制批量采购与维修储备；武器升级排序始终优先于围墙升级
 #   day1: 建完半圈围墙(石头) + 两个武器升级
 #   day2: 4 个前挡围墙升级 + 一个武器升2级
 #   day3: 4 个前挡升2级 + 两个武器升2级
@@ -21,7 +20,6 @@ DAY_PLAN={1:{'front_walls':0,'weapons':2},
           3:{'front_walls':4,'weapons':2}}
 DAY_PLAN_DEFAULT={'front_walls':4,'weapons':2}
 DAY1_ORE_PHASE_ROUNDS=30                  # 第1天先赚钱: 前30回合全员采铁/铜, 之后再采石修墙
-SPEND_WALL_VOUCHER=20                     # 回家前清钱: 围墙券价(参考)
 SPEND_FIXER=10                            # 回家前清钱: 修复包价
 SPEND_TRIP_SLACK=3                        # 清钱时点余量(回合)
 STATION_FALLBACK_HP=1000                  # 兜底: 撑过第3夜后基地低于该血量 -> 优先升级基地
@@ -29,10 +27,7 @@ STATION_FALLBACK_DAY=4                    # 兜底生效的最早天数
 FRONT_REPAIR_RATIO=0.7                    # 面向机器人的前排墙: 血量低于该比例即主动修复
 ANY_REPAIR_RATIO=0.5                      # 其余围墙: 低于该比例即修复
 CRITICAL_REPAIR_RATIO=0.25                # 濒临被打爆: 即使要现买修复包也优先于升级
-MIN_MINE_BATCH=8                          # 单趟至少采够的矿石数(避免采几块就回家)
 MIN_SELL_BATCH=6                          # 至少攒够这么多才值得跑一趟小贩
-WALL_FIXER_BUDGET_KEEP=20                 # 无武器升级需求时, 买修复包只保留的金币
-WEAPON_VOUCHER_KEEP=100                   # 仍有武器待升2级时, 为其保留的券价
 HP={'station':(1500,3000,4500),'wall':(1000,1500,2000),
     'rocket':(1000,1500,2000),'railgun':(1000,1500,2000),'gatling':(1000,1500,2000)}
 
@@ -62,6 +57,8 @@ class Economy:
 
     def weapon_quota_left(self):
         """当天还需完成的武器升级数量。"""
+        if not any(w.level < 3 for w in self.turn.weapons()):
+            return 0
         return max(0, self.plan()['weapons'] - self.m.day_weapon_upgrades)
 
     def wall_phase_active(self):
@@ -72,27 +69,13 @@ class Economy:
         return done < max(1,len(walls)//2)
 
     def options(self):
-        """升级/修复候选，优先级（issue #3）:
-
-        - 保命项永远最优先: 濒危基地(<60%血)、**任意等级围墙血量<50% 的 WallFixer 修复**
-          （面向机器人的前排墙优先）
-        - 前期(day<=2): 武器升 2 级优先 -> 围墙升 2 级 -> 武器升 3 级 -> 围墙升 3 级
-        - 第3天起: 迎敌半圈围墙升到 2 级（≥半数达成前）优先，随后武器接管
-        """
+        """已有修复包和危急建筑优先，其次武器、围墙和常规基地升级。"""
         options=[]
-        # 天数兜底: memory.day 未初始化时按回合号推导，保证优先级判断稳定
-        day=self.m.day or ((self.turn.round_no-1)//130+1)
-        weapon_first=day<=2          # issue #3: 前期(day1-2)优先武器升级
-        # 围墙阶段: 迎敌半圈的主要墙体（≥一半）升到2级前，围墙券优先于武器券；
-        # 达标后武器升级接管（需求3: 围墙升级成功后若还有余量，再执行武器升级）。
-        # 若不设这个"阶段完成"判据，10 座墙的券会一直插队，武器永远升不上去。
-        wall_phase=self.wall_phase_active()
-        wall_quota=self.wall_quota_left()>0      # 当天围墙配额未完成 -> 围墙优先
-        weapon_quota=self.weapon_quota_left()>0  # 围墙配额完成后再升武器
+        wall_quota=self.wall_quota_left()>0
+        held_fixer=any('WallFixer' in r.backpack for r in self.turn.controllable())
         for u in (*self.turn.weapons(), *self.turn.walls(), self.turn.station()):
             if u is None: continue
             level=max(1,min(3,u.level)); ratio=u.health/HP[u.kind][level-1]
-            held_fixer=any('WallFixer' in r.backpack for r in self.turn.controllable())
             front = u.kind=='wall' and u.pos in self.p.walls
             # 主动防御修复: 面向机器人的前排墙血量<70% 即修(不等被打爆), 其余墙<50% 才修;
             # 手上已有修复包 -> 最高优先级(不花金币); 需现买则排在武器/围墙升级之后。
@@ -245,12 +228,7 @@ class Economy:
         # One purchasing courier at a time; the other worker keeps producing money.
         if any(j.get('type') in ('upgrade','order') for j in self.m.jobs.values()): return
         shops=[q for q,k in self.turn.zones.items() if k=='weaponShop']
-        # 要求4/5: 每天最高优先级是赚钱升级; 券的取舍按天兜底:
-        #   - 当天武器配额(第1天=2, 第2天=1, 第3天起=2)未完成时, 武器券优先;
-        #   - 第2天半圈围墙还没修完时, 围墙券优先(入夜前必须修完整);
-        #   - 其余情况为"下一张武器券"保留金币, 围墙券只吃闲钱。
-        # 要求5: 武器升级券优先于围墙升级券 -> 为"下一张武器券"保留金币,
-        # 围墙券只吃超出的闲钱(围墙靠工人用石头现场修, 不靠券抢钱)。
+        # 为尚未满级的武器保留券预算，围墙券只使用超出的金币。
         weapon_reserve=0
         for w in self.turn.weapons():
             lv=max(1,min(3,w.level))
@@ -285,7 +263,7 @@ class Economy:
                     if stand is None: continue
                     delivery=self.p.geo.to(target.pos).get(stand,INF)
                     return_cost=max((self.p.home_cost(role,s) for s in self.p.geo.seats(target.pos)),default=INF)
-                    cost=routes.cost[stand]+delivery+return_cost+2+5
+                    cost=routes.cost[stand]+delivery+return_cost+2+JOURNEY_MARGIN
                     if cost<self.p.remaining:
                         choices.append((cost,role,shop,count))
             if choices:
@@ -317,11 +295,8 @@ class Economy:
         shops=[q for q,k in self.turn.zones.items() if k=='weaponShop']
         return min(shops,key=routes.distance,default=None)
 
-    def _courier_for(self,price,extra_slack=0,skip_item=None):
-        """挑一名能负担"去商店->再回防"整段时间的工人做采购。
-
-        extra_slack: 允许的额外回合余量（首日召唤令专差可延伸入夜, 见 NIGHT_OVERRUN）。
-        """
+    def _courier_for(self,price,skip_item=None):
+        """挑选能在回防期限前完成商店往返的工人。"""
         shops=[q for q,k in self.turn.zones.items() if k=='weaponShop']
         best=None
         for role in self.turn.workers():
@@ -331,8 +306,8 @@ class Economy:
             for shop in shops:
                 stand=routes.adjacent(shop)
                 if stand is None: continue
-                cost=routes.cost[stand]+self.p.home_cost(role,stand)+2+RETURN_MARGIN
-                if cost<self.p.remaining+extra_slack and (best is None or cost<best[0]):
+                cost=routes.cost[stand]+self.p.home_cost(role,stand)+2+JOURNEY_MARGIN
+                if cost<self.p.remaining and (best is None or cost<best[0]):
                     best=(cost,role,shop)
         return (best[1],best[2]) if best else None
 
@@ -539,6 +514,11 @@ class Economy:
         if fam=='stone': return ('stone',)
         return ('iron','copper')          # 赚钱阶段优先铁/铜(单价高)
 
+    @staticmethod
+    def journey_score(value, sale_time, home_time):
+        """采矿与立即出售都按金币 / 完整出售回防行程比较。"""
+        return value / max(1, sale_time + home_time)
+
     def sale_candidates(self,role,routes,extra=None):
         stock=Counter(x for x in role.backpack if x in ORES)
         if extra: stock.update(extra)
@@ -550,9 +530,9 @@ class Economy:
             for seat in self.p.geo.seats(vendor):
                 walk=routes.cost.get(seat,INF)
                 home=self.p.home_cost(role,seat)
-                total=walk+len(stock)+home+5
+                total=walk+len(stock)+home+JOURNEY_MARGIN
                 if total<self.p.remaining:
-                    candidates.append({'score':value/max(1,walk+len(stock)),
+                    candidates.append({'score':self.journey_score(value,walk+len(stock),home),
                         'vendor':vendor,'seat':seat,'total':total,'stock':stock,'value':value})
         return candidates
 
@@ -567,12 +547,11 @@ class Economy:
             price=self.p.prices.get(kind,0)
             if kind not in ORES or price<=0 or self.blocked(mine,kind): continue
             if kinds is not None and kind not in kinds: continue
-            # 一趟尽量采够(MIN_MINE_BATCH 起步, 受矿点剩余与背包容量限制)
+            # 枚举所有可完成的采集量；由收益和返程预算选择批量。
             left_in_mine=max(1,10-self.m.mine_used.get(mine,0)-self.mine_claims[mine])
             if self.mine_claims.get(mine,0)>0:
                 continue        # 要求6: 两名工人不同时采同一个矿
             quantity=min(capacity,left_in_mine)
-            quantity=min(capacity,max(quantity,min(MIN_MINE_BATCH,left_in_mine)))
             sales=len(set(stock)|{kind})
             for entry in self.p.geo.seats(mine):
                 approach=routes.cost.get(entry,INF)
@@ -583,16 +562,14 @@ class Economy:
                     for exit in self.p.geo.seats(vendor):
                         trip=self.p.geo.field([exit]).get(entry,INF)
                         home=self.p.home_cost(role,exit)
-                        max_q=min(quantity,self.p.remaining-approach-trip-sales-home-6)
+                        max_q=min(quantity,self.p.remaining-approach-trip-sales-home-JOURNEY_MARGIN-1)
                         if max_q<1: continue
                         for q in range(1,int(max_q)+1):
-                            # 评分 = 金币/回合: 分母含"去矿 + 采集 + 去小贩 + 回家"全程,
-                            # 因此离家近、离小贩近的矿天然占优(要求3/6 距离优先)
                             time=approach+q+trip+sales
-                            score=(inventory_value+price*q)/max(1,time+home)
+                            score=self.journey_score(inventory_value+price*q,time,home)
                             candidates.append({'score':score,'target':mine,'kind':kind,
                                 'entry':entry,'vendor':vendor,'exit':exit,'left':q,
-                                'total':time+home+5,'price':price,'type':'mine'})
+                                'total':time+home+JOURNEY_MARGIN,'price':price,'type':'mine'})
         return candidates
 
     def sell(self,role,routes,job):
@@ -627,7 +604,7 @@ class Economy:
             if not invalid and not changed_price and job['left']>0:
                 entry=job['entry']; exit=job['exit']
                 cost=(routes.cost.get(entry,INF)+job['left']+
-                      self.p.geo.field([exit]).get(entry,INF)+3+self.p.home_cost(role,exit)+5)
+                      self.p.geo.field([exit]).get(entry,INF)+3+self.p.home_cost(role,exit)+JOURNEY_MARGIN)
                 if cost<self.p.remaining:
                     self.mine_claims[job['target']]+=job['left']
                     if role.pos==entry:

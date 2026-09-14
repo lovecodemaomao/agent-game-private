@@ -1,42 +1,15 @@
-"""Generic task/LLM protocol, daily news reasoning, and treasure execution.
+"""Task context, deterministic solvers, reusable guidance and LLM fallback.
 
-LLM-generated shell text is returned ONLY in executeCmd for the judge sandbox.
-It is never executed by this agent's host process.
-
-自进化任务采用"固定探测 -> 知识汇总 -> LLM 给 API 调用"的分阶段流程：
-  1) 前 3 回合用固定命令探测任务目录（只探测 /tmp/selfEvolutionTask/，
-     不做从根目录的全盘递归，避免 15 秒沙盒超时）；
-  2) 把 3 轮探测结果汇总成一次信息完整的 prompt，让 LLM 直接给出正确 API 调用
-     （带上赛事约定的 X-API-Key 头，并尝试不同参数组合）；
-  3) 后续每轮把新的命令结果回灌给 LLM，逐步逼近正确答案。
+Commands are returned to the judge; never executed by the agent process.
 """
 import hashlib
 import json
+import logging
 from collections import Counter
 from .protocol import Pos, distance
 from .geography import INF
+from . import templates
 
-# 自进化任务目录与接口约定（赛事环境固定，禁止从 / 全盘递归）
-TASK_DIR = '/tmp/selfEvolutionTask/'
-HERITAGE_API_KEY = 'heritage-api-key-2024'
-PROBES = (
-    # 第1轮: 只看任务目录结构
-    "find %s -maxdepth 3 2>/dev/null | head -80" % TASK_DIR,
-    # 第2轮: 打印目录内文本文件内容（限深、限大小、带文件名分隔）
-    ("find %s -maxdepth 3 -type f -size -64k 2>/dev/null | head -20 | "
-     "while read f; do echo \"===== $f =====\"; cat \"$f\"; done | head -400" % TASK_DIR),
-    # 第3轮: 抽取接口/参数线索
-    ("grep -rInE 'http|api|key|token|param|curl|POST|GET|json' %s 2>/dev/null | head -60"
-     % TASK_DIR),
-)
-PROBE_LIMIT = len(PROBES)
-
-
-def task_param(text):
-    """抽取任务参数(如"查询XX今天的天气"里的城市名), 用于复用时的命令参数替换。"""
-    import re as _re
-    m=_re.search(r'(?:查询|获取)([^\s,。，]{1,12}?)(?:今天|明天|当天|的天气)', str(text or ''))
-    return m.group(1).strip() if m else ''
 
 def parse_json(text):
     text = str(text or '').strip()
@@ -117,16 +90,24 @@ class Tasks:
                        and result is not False and not errors.intersection({1,2,4})
                        and self.turn.round_no <= old['start']+old['timeout']
                        and any(distance(self.pioneer.pos,q)<=1 for q in old['positions']))
+            elapsed = max(1, self.turn.round_no-old['start'])
+            self.m.task_stats['success' if success else 'failed'] += 1
+            self.m.task_stats['rounds_total'] += elapsed
+            self.event('TASK_SUCCESS' if success else 'TASK_FAIL', rounds=elapsed)
+            self.m.task_runs.append({'family':old.get('signature',{}).get('family','unknown'),
+                'success':success, 'rounds':elapsed, 'commands':old.get('commands',0),
+                'llm_calls':old.get('llm_calls',0), 'source':old.get('source','unknown')})
+            self.m.task_runs[:] = self.m.task_runs[-12:]
             if success:
-                # 提取本次成功用到的命令与被接受的答案, 供同类任务直接复用(省探测+LLM往返)
-                last_cmd=next((h.get('command') for h in reversed(old['history']) if h.get('command')),None)
-                last_answer=next((h.get('answer') for h in reversed(old['history']) if h.get('answer')),None)
-                self.m.skills.append({'task':old['desc'][:4000], 'method':old.get('skill','')[:4000],
-                                      'command':last_cmd, 'answer':last_answer,
-                                      'param':task_param(old['desc']),
-                                      'steps':old['history'][-6:]})
+                sig = old.get('signature') or templates.signature(old['desc'],old.get('context','')).dump()
+                entry = {'family':sig['family'], 'signature':sig}
+                if sig['family'] == 'unknown':
+                    # Reuse methods as LLM guidance, never stale commands/answers.
+                    entry.update(task=old['desc'][:4000], method=old.get('skill','')[:4000])
+                self.m.skills.append(entry)
                 self.m.skills[:] = self.m.skills[-12:]
-                self.m.event('task completed; saved reusable procedure')
+            if self.m.pending_llm and self.m.pending_llm['channel'] == 'task':
+                self.m.pending_llm = None
             self.m.task = None
             self.m.task_choice = None
         if desc and self.pioneer and self.m.task is None:
@@ -137,25 +118,22 @@ class Tasks:
             self.m.task = {'desc':desc,'start':start,'timeout':int(choice.get('timeoutRounds') or 100),
                            'token':token,'positions':choice.get('positions',[]),
                            'history':[],'proposal':None,'waiting_cmd':False,'skill':'',
-                           'probes':0,'probe_results':[],'probing':False}
-            # 同类任务快速通道: 题干结构一致(仅参数不同) -> 直接复用已验证的命令
-            reusable=self.reusable(desc)
-            if reusable:
-                self.m.task['reuse']=reusable
-                self.m.event('task matches a saved procedure; skip probing/LLM')
+                           'context':'', 'context_done':False, 'result':'',
+                           'result_seq':0, 'derived_seq':0, 'attempted':set(),
+                           'commands':0, 'llm_calls':0, 'rejected':set()}
+            self.m.task_stats['accepted'] += 1
+            self.event('TASK_NEW')
 
-    def reusable(self,desc):
-        """在已保存的 SOP 里找题干结构一致的条目(把数字/城市名等参数抽象掉再比)。"""
-        import re as _re
-        def norm(text):
-            text=_re.sub(r'[0-9]+','#',str(text or ''))
-            text=_re.sub(r'[\u4e00-\u9fa5]{2,4}(?=今天|的天气)','CITY',text)
-            return text[:400].strip()
-        key=norm(desc)
-        for entry in reversed(self.m.skills):
-            if entry.get('command') and norm(entry.get('task'))==key:
-                return entry
-        return None
+    def event(self, name, **fields):
+        # Only internal labels/counters; never credentials, task text or answers.
+        text = name + ''.join(f' {key}={value}' for key,value in fields.items())
+        self.m.event(text)
+        logging.getLogger(__name__).info(text)
+
+    def reusable(self, desc, context=''):
+        sig = templates.signature(desc, context).dump()
+        return next((entry for entry in reversed(self.m.skills)
+                     if entry.get('signature') == sig), None)
 
     def run(self):
         self.sync_task()
@@ -191,7 +169,8 @@ class Tasks:
             target = min(point['positions'],key=routes.distance)
             # Unknown tasks get a useful initial budget, not the full timeout.
             # Different task families may need many turns; never assume weather.
-            estimated = min(int(point.get('timeoutRounds') or 20),20)
+            estimated = min(int(point.get('timeoutRounds') or 20),
+                            templates.estimate_task_rounds(str(point.get('description') or '')))
             if not self.p.enough_time(self.pioneer,routes,target,estimated+1):
                 continue
             reward = float(point.get('scoreReward',0))+float(point.get('goldReward',0))
@@ -205,117 +184,118 @@ class Tasks:
             self.m.task_choice['accepted_round']=self.turn.round_no
         return self.p.interact(self.pioneer,routes,target,'acceptTask')
 
+    def dump(self, task):
+        return task.get('context', '')
+
+    def execute(self, task, command, source):
+        digest = hashlib.sha256(command.encode()).hexdigest()
+        if digest in task['attempted']:
+            task['history'].append({'feedback':'Identical command already attempted; revise the procedure.'})
+            return False
+        task['attempted'].add(digest)
+        task['waiting_cmd'] = True
+        task['source'] = source
+        task['commands'] += 1
+        task['history'].append({'command':command, 'source':source})
+        self.p.execute_cmd = templates.command('llm', script=command) if source == 'llm' else command
+        self.event('TASK_EXEC', source=source)
+        return True
+
+    def submit(self, task, answer, source):
+        answer = answer if isinstance(answer,str) else json.dumps(answer,ensure_ascii=False)
+        if answer in task['rejected'] or len(answer.encode('utf-8')) > 12000:
+            return False
+        self.p.commands[str(self.pioneer.unit_id)] = {'action':'submitAnswer','taskAnswer':answer}
+        task['history'].append({'answer':answer})
+        task['submitted'] = answer
+        self.event('TASK_SUBMIT', source=source, round_cost=self.turn.round_no-task['start'])
+        return True
+
     def solve(self):
-        task = self.m.task
-        role = self.pioneer
+        task, role = self.m.task, self.pioneer
         if not any(distance(role.pos,q)<=1 for q in task['positions']):
-            # Do not issue executeCmd outside the known task interaction range.
+            return False
+        deadline = task['start']+task['timeout']
+        if self.turn.round_no >= deadline:
             return False
         if task['waiting_cmd']:
-            result = str(self.payload.get('lastCmdResult') or '')
-            task['history'].append({'result':result[:40000] or '[missing command result]'})
-            if task.get('probing'):
-                task['probe_results'].append(result[:20000])
-                task['probing'] = False
-            task['waiting_cmd']=False
+            task['result'] = str(self.payload.get('lastCmdResult') or '')[:50000]
+            task['result_seq'] += 1
+            task['history'].append({'result':task['result'] or '[missing command result]'})
+            task['waiting_cmd'] = False
+            if task['source'] == 'context':
+                task['context'] = task['result']
+                task['context_done'] = True
+                self.event('TASK_CONTEXT')
         if task.get('submitted'):
-            task['history'].append({'feedback':self.payload.get('errors',[]),
-                                    'task_still_active':True})
-            task['submitted']=False
+            task['rejected'].add(task['submitted'])
+            task['history'].append({'feedback':self.payload.get('errors',[]), 'task_still_active':True})
+            task['submitted'] = None
         proposal = task.pop('proposal',None)
-        # Preserve the task while reasoning, but do not sacrifice mandatory defense.
-        deadline = task['start']+task['timeout']
-        returning = (not self.turn.is_day or self.p.remaining <= self.p.home_cost(role,role.pos)+5)
-        # 快速通道: 同类任务直接重放已验证命令(零探测、零 LLM 往返)
-        if task.get('reuse') and not task['waiting_cmd'] and not returning:
-            entry=task['reuse']
-            if not task.get('reuse_done'):
-                task['reuse_done']=True
-                task['waiting_cmd']=True
-                saved=entry.get('param') or ''
-                now=task_param(task['desc'])
-                command=entry['command']
-                same=saved and now and saved==now
-                if saved and now and not same:
-                    # 参数不同: 把旧参数替换成新参数后重跑, 不能沿用旧结果/旧答案
-                    command=command.replace(saved, now)
-                task['reuse_same']=bool(same)
-                task['history'].append({'command':command})
-                self.p.execute_cmd=command
-                self.m.event('task: replay saved procedure (%s)' % ('same params' if same else 'params substituted'))
+        # A fresh result from ANY source gets first claim on this turn. Never
+        # derive from an old result again after an answer rejection.
+        if task['result_seq'] > task['derived_seq']:
+            task['derived_seq'] = task['result_seq']
+            answer = templates.derive_answer(task['desc'],self.dump(task),task['result'])
+            if answer is not None and self.submit(task,answer,'direct'):
+                self.event('TASK_DIRECT_ANSWER', source=task['source'])
                 return True
-            result=str(self.payload.get('lastCmdResult') or '')
-            if not result:
-                return False
-            if task.get('reuse_same') and entry.get('answer'):
-                # 完全同题: 直接提交已验证答案(零 LLM)
-                answer=entry['answer']
-                self.p.commands[str(role.unit_id)]={'action':'submitAnswer','taskAnswer':answer}
-                task['history'].append({'answer':answer})
-                task['submitted']=True
-                task['reuse']=None
-                self.m.event('task: submitted saved answer')
-                return True
-            # 参数已变: 用新结果请 LLM 给出答案(省掉 3 轮探测, 不做无依据作答)
-            task['reuse']=None
-            self.p.history_note=result[:20000]
-            task['history'].append({'result':result[:20000]})
-            prompt=('沙盒命令已返回结果, 请据此给出任务答案, 只返回JSON对象: '
-                    '{"request_id":"原样回传","kind":"answer","answer":"答案","skill":"可复用方法"}。'
-                    '禁止编造结果中不存在的信息。')
-            self.send('task',prompt,task['token'])
-            return True
-        # 阶段一: 固定探测（只探测任务目录，最多 PROBE_LIMIT 轮，不消耗 LLM 额度）
-        if task.get('probes',0) < PROBE_LIMIT and not task['waiting_cmd'] and not returning:
-            command = PROBES[task['probes']]
-            task['probes'] += 1
-            task['probing'] = True
-            task['waiting_cmd'] = True
-            task['history'].append({'command':command})
-            self.p.execute_cmd = command
-            self.m.event(f'task probe {task["probes"]}/{PROBE_LIMIT}')
-            return True
+        returning = not self.turn.is_day or self.p.remaining <= self.p.home_cost(role,role.pos)+5
+        # Preserve an already available LLM answer even at the return boundary.
         if proposal:
             if isinstance(proposal.get('skill'),str):
-                task['skill']=proposal['skill'][:4000]
-            kind = proposal.get('kind')
-            if kind=='answer' and 'answer' in proposal:
-                answer=proposal['answer']
-                answer=answer if isinstance(answer,str) else json.dumps(answer,ensure_ascii=False)
-                self.p.commands[str(role.unit_id)]={'action':'submitAnswer','taskAnswer':answer}
-                task['history'].append({'answer':answer[:12000]})
-                task['submitted']=True
-                return True
-            command=proposal.get('command')
-            if kind=='command' and isinstance(command,str) and command.strip() and len(command)<=16000 and not returning:
-                self.p.execute_cmd=command
-                task['history'].append({'command':command})
-                task['waiting_cmd']=True
-                return True
-            task['history'].append({'feedback':'Invalid output schema or insufficient time for command.'})
-        if returning or self.turn.round_no >= deadline:
-            self.m.event('task time budget exhausted; pioneer returning to defend')
+                task['skill'] = proposal['skill'][:4000]
+            if proposal.get('kind') == 'answer' and 'answer' in proposal:
+                if self.submit(task,proposal['answer'],'llm'):
+                    return True
+            elif (proposal.get('kind') == 'command' and isinstance(proposal.get('command'),str)
+                  and proposal['command'].strip() and len(proposal['command']) <= 16000 and not returning):
+                if self.execute(task,proposal['command'],'llm'):
+                    return True
+            task['history'].append({'feedback':'Invalid, duplicate or late proposal; revise using current evidence.'})
+        if returning:
             return False
-        self.send('task',self.knowledge_prompt(task,role),task['token'])
+        # Full descriptions can solve immediately; file-only tasks collect once.
+        preset = templates.plan(task['desc'],self.dump(task)) if not task.get('template_tried') else None
+        if preset:
+            family, command = preset
+            task['signature'] = templates.signature(task['desc'],self.dump(task)).dump()
+            self.event('TASK_SIGNATURE', family=family)
+            if self.reusable(task['desc'],self.dump(task)):
+                self.m.task_stats['skill_hit'] += 1
+                self.event('TASK_SKILL_MATCH', family=family)
+            task['template_tried'] = True
+            self.m.task_stats['template_hit'] += 1
+            self.event('TASK_TEMPLATE_MATCH', family=family)
+            return self.execute(task,command,'template')
+        if not task['context_done'] and not task.get('template_tried'):
+            return self.execute(task,templates.locate_command(task['desc']),'context')
+        task['signature'] = templates.signature(task['desc'],self.dump(task)).dump()
+        if self.send('task',self.knowledge_prompt(task,role),task['token']):
+            task['llm_calls'] += 1
+            self.m.task_stats['llm_calls'] += 1
+            self.m.task_stats['llm_fallback'] += 1
+            self.event('TASK_LLM_FALLBACK')
         return True
 
     def knowledge_prompt(self,task,role):
-        """阶段二: 把 3 轮探测结果一次性喂给 LLM，要求直接给出可用的 API 调用。"""
         deadline=task['start']+task['timeout']
-        return '''你是比赛开拓者的任务求解器，已完成沙盒任务目录的固定探测。现在直接给出可执行的 API 调用。
+        guidance = self.reusable(task['desc'],self.dump(task))
+        return '''你是比赛开拓者的通用任务求解器。根据当前任务、文档、最新命令结果和错误反馈求解。
 只返回一个JSON对象：
-1. 需要调用接口：{"request_id":"原样回传","kind":"command","command":"一条shell命令","skill":"可复用方法"}
-2. 信息已足够作答：{"request_id":"原样回传","kind":"answer","answer":"题目要求的答案","skill":"可复用方法"}
+1. 需要执行命令：{"request_id":"原样回传","kind":"command","command":"一条shell命令","skill":"可复用方法"}
+2. 信息足够作答：{"request_id":"原样回传","kind":"answer","answer":"题目要求的答案","skill":"可复用方法"}
 硬性要求：
-- 命令用 curl 调用探测到的接口，必须带鉴权头 -H "X-API-Key: ''' + HERITAGE_API_KEY + '''"；
-- 参数名与取值必须来自探测结果（文件内容/示例/字段名），不要臆造接口地址；
-- 上一次命令失败或答案不完整时，换不同的参数组合再试（例如 id/序号/名称/日期逐个变化），不要重复同样的命令；
-- 沙盒只允许基础 shell/python，无外网，单次最长 15 秒，输出上限 64KB；命令结果下一回合返回；
-- 拿到关键输出后立刻用 kind=answer 提交，不要空转。
+- 任务、URL、参数、鉴权和答案格式以本次文档为准；禁止复制旧题答案或臆造数据。
+- 不局限于 API；可使用 shell/python 处理文件、工程修复或其他任务。
+- 每条命令最多 15 秒，输出必须少于 48KB。自行设置网络/子进程超时，禁止从 / 全盘递归。
+- 把相关步骤合成一条有界命令；API 数据完整性不确定时继续验证，不能用不完整的 sample 计算全量答案。
+- 确定最终答案时可输出 __ANSWER <JSON/string>，checker 的 TOKEN 也会被直接识别。
+- 模板或此前命令失败后必须修订方案，不要重复相同命令；新结果为空不能假装旧结果仍有效。
 '''+json.dumps({'task':task['desc'],'round':self.turn.round_no,
                 'deadline':min(deadline,self.turn.round_no+self.p.remaining-self.p.home_cost(role,role.pos)-5),
-                'probe_results':task.get('probe_results',[])[-PROBE_LIMIT:],
-                'history':task['history'][-10:],'known_procedures':self.m.skills[-6:],
+                'context':self.dump(task), 'latest_result':task['result'],
+                'history':task['history'][-6:], 'known_procedure':guidance,
                 'errors':self.payload.get('errors',[])},ensure_ascii=False)
 
     def accept_news(self,value):

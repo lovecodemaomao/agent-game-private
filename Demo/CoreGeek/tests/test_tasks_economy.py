@@ -7,6 +7,7 @@ from agent.memory import Memory
 from agent.runtime import Agent
 from agent.protocol import Turn,Pos,distance
 from agent.tasks import Tasks
+from agent import templates
 
 
 def task_fixture():
@@ -72,7 +73,7 @@ class TaskTests(unittest.TestCase):
                 p['roundNo']=n+1;p['lastCmdResult']=''
                 p['llmResp']=llm_reply(m,kind='command',command=command,skill='复用输入解析与求解方法')
                 r=decide_response(p,m)
-                self.assertEqual(r['executeCmd'],command)
+                self.assertEqual(r['executeCmd'],templates.command('llm',script=command))
                 self.assertFalse(r['prompt'])
                 p['roundNo']=n+2;p['llmResp']='';p['lastCmdResult']=output
                 r=decide_response(p,m)

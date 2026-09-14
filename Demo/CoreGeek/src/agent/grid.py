@@ -16,6 +16,7 @@ class Routes:
         self.start = moving.pos
         self.cost = {moving.pos: 0}
         self.first = {}
+        self._adjacent = {}
         queue = deque([moving.pos])
         while queue:
             current = queue.popleft()
@@ -27,10 +28,11 @@ class Routes:
                 queue.append(pos)
 
     def adjacent(self, target: Pos):
-        candidates = [p for p in neighbours(target) if p in self.cost]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda p: (self.cost[p], p.x, p.y))
+        if target not in self._adjacent:
+            self._adjacent[target] = min(
+                (p for p in neighbours(target) if p in self.cost),
+                key=lambda p: (self.cost[p], p.x, p.y), default=None)
+        return self._adjacent[target]
 
     def distance(self, target: Pos):
         stand = self.adjacent(target)

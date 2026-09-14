@@ -19,6 +19,10 @@ class Memory:
     task: dict | None = None
     task_choice: dict | None = None
     skills: list = field(default_factory=list)
+    task_stats: dict = field(default_factory=lambda: dict.fromkeys(
+        ('accepted', 'success', 'failed', 'template_hit', 'skill_hit',
+         'llm_fallback', 'rounds_total', 'llm_calls'), 0))
+    task_runs: list = field(default_factory=list)
     jobs: dict = field(default_factory=dict)
     last_commands: dict = field(default_factory=dict)
     last_roles: dict = field(default_factory=dict)

@@ -15,7 +15,7 @@ from test_strategy import fixture, unit
 from agent.brain import Planner, decide_response, wall_sites
 from agent.memory import Memory
 from agent.protocol import Turn, Pos, distance
-from agent.economy import MIN_MINE_BATCH, STATION_FALLBACK_HP, STATION_FALLBACK_DAY
+from agent.economy import STATION_FALLBACK_HP, STATION_FALLBACK_DAY
 from agent.tasks import Tasks
 
 
@@ -78,8 +78,8 @@ class BatchTests(unittest.TestCase):
         role = planner.turn.workers()[0]
         cands = planner.economic.mining_candidates(role, planner.route(role))
         self.assertTrue(cands)
-        self.assertGreaterEqual(max(c['left'] for c in cands), MIN_MINE_BATCH,
-                                '单趟采集量应不小于 MIN_MINE_BATCH')
+        self.assertGreaterEqual(max(c['left'] for c in cands), 8,
+                                '时间和背包充足时应允许大批量采集')
 
     def test_does_not_run_to_vendor_for_a_few_ores(self):
         # 只揣着 3 块矿且不在小贩旁 -> 不专程跑小贩（继续采）
@@ -158,66 +158,49 @@ class TaskReuseTests(unittest.TestCase):
         p['phaseTask'] = desc
         return p
 
-    def test_same_structure_task_matches_saved_procedure(self):
+    def test_legacy_raw_command_is_not_replayed(self):
         m = Memory()
-        m.skills.append({'task': '【自进化任务】请查询成都今天的天气并提交答案。\
-第三方天气API文档：GET http://x/weather?city=<城市名>',
-                         'command': 'curl -s "http://x/weather?city=成都"',
-                         'answer': '成都今天天气：阴', 'method': 'weather', 'steps': []})
-        p = self.task_payload('【自进化任务】请查询上海今天的天气并提交答案。\
-第三方天气API文档：GET http://x/weather?city=<城市名>')
-        planner = Planner(Turn.load(p), p, m)
-        tasks = Tasks(planner)
-        tasks.sync_task()
-        self.assertIsNotNone(m.task.get('reuse'), m.task)
-
-    def test_reuse_replays_command_without_probing_or_llm(self):
-        m = Memory()
-        m.skills.append({'task': '查询成都今天的天气。GET http://x/weather?city=<城市名>',
-                         'command': 'curl -s "http://x/weather?city=成都"',
-                         'answer': '成都今天天气：阴', 'method': 'weather', 'steps': []})
-        p = self.task_payload('查询上海今天的天气。GET http://x/weather?city=<城市名>')
-        planner = Planner(Turn.load(p), p, m)
-        tasks = Tasks(planner)
-        tasks.run()
-        self.assertEqual(planner.execute_cmd, 'curl -s "http://x/weather?city=成都"')
-        self.assertEqual(planner.prompt, '', '复用通道不应请求 LLM')
-
-    def test_same_params_reuse_submits_saved_answer(self):
-        # 完全同题(同城市): 重跑命令后直接提交已验证答案(零 LLM)
-        m = Memory()
-        m.skills.append({'task': '查询成都今天的天气。GET http://x/weather?city=<城市名>',
-                         'command': 'curl -s "http://x/weather?city=成都"',
-                         'answer': '成都今天天气：阴', 'param': '成都', 'method': 'weather', 'steps': []})
-        p = self.task_payload('查询成都今天的天气。GET http://x/weather?city=<城市名>')
+        m.skills.append({'task':'old task', 'command':'echo stale', 'answer':'old answer'})
+        p = self.task_payload('old task')
         planner = Planner(Turn.load(p), p, m)
         Tasks(planner).run()
-        p['roundNo'] = 2
-        p['lastCmdResult'] = '[exitCode:0]\n{"city":"成都","weather":"阴"}'
-        planner2 = Planner(Turn.load(p), p, m)
-        Tasks(planner2).run()
-        cmd = planner2.commands.get('4')
-        self.assertIsNotNone(cmd, planner2.commands)
-        self.assertEqual(cmd['action'], 'submitAnswer')
-        self.assertIn('阴', cmd['taskAnswer'])
+        self.assertNotEqual(planner.execute_cmd, 'echo stale')
+        self.assertNotIn('4', planner.commands)
 
-    def test_different_params_substitutes_and_does_not_reuse_old_answer(self):
-        # 参数不同: 命令里的旧参数被替换为新参数重跑, 且不沿用旧答案(避免答错)
+    def test_same_description_does_not_submit_saved_answer(self):
         m = Memory()
-        m.skills.append({'task': '查询成都今天的天气。GET http://x/weather?city=<城市名>',
-                         'command': 'curl -s "http://x/weather?city=成都"',
-                         'answer': '成都今天天气：阴', 'param': '成都', 'method': 'weather', 'steps': []})
-        p = self.task_payload('查询上海今天的天气。GET http://x/weather?city=<城市名>')
+        m.skills.append({'task':'read current value', 'command':'cat value', 'answer':'stale'})
+        p = self.task_payload('read current value')
+        Tasks(Planner(Turn.load(p), p, m)).run()
+        p['roundNo'] = 2
+        p['lastCmdResult'] = 'fresh value: changed'
         planner = Planner(Turn.load(p), p, m)
         Tasks(planner).run()
-        self.assertIn('上海', planner.execute_cmd, '命令参数应被替换为新城市')
-        self.assertNotIn('成都', planner.execute_cmd)
+        self.assertNotIn('4', planner.commands)
+        self.assertIn('fresh value: changed', planner.prompt)
+
+    def test_unknown_skill_is_guidance_for_current_context(self):
+        from agent import templates
+        m = Memory()
+        desc, context = 'unknown graph problem', 'current graph'
+        sig = templates.signature(desc, context).dump()
+        m.skills.append({'family':'unknown', 'signature':sig, 'method':'use breadth-first search'})
+        p = self.task_payload(desc)
+        Tasks(Planner(Turn.load(p), p, m)).run()
         p['roundNo'] = 2
-        p['lastCmdResult'] = '[exitCode:0]\n{"city":"上海","weather":"多云"}'
-        planner2 = Planner(Turn.load(p), p, m)
-        Tasks(planner2).run()
-        self.assertNotIn('4', planner2.commands, '不应沿用旧城市的答案')
-        self.assertTrue(planner2.prompt, '应请 LLM 依据新结果作答')
+        p['lastCmdResult'] = context
+        planner = Planner(Turn.load(p), p, m)
+        Tasks(planner).run()
+        self.assertIn('use breadth-first search', planner.prompt)
+        self.assertIn(context, planner.prompt)
+
+    def test_changed_unknown_context_does_not_match_skill(self):
+        from agent import templates
+        m = Memory()
+        m.skills.append({'signature':templates.signature('unknown', 'old').dump(), 'method':'old method'})
+        p = self.task_payload('unknown')
+        tasks = Tasks(Planner(Turn.load(p), p, m))
+        self.assertIsNone(tasks.reusable('unknown', 'new'))
 
 
 if __name__ == '__main__':

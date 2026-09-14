@@ -1,7 +1,6 @@
 """三项修改的回归测试。
 
-1. 任务探测: 只探测 /tmp/selfEvolutionTask/（不从根目录全盘递归），3 轮固定探测后
-   用已知信息请求 LLM 直接给出 API 调用（带 X-API-Key 头、尝试不同参数组合）
+1. 任务探测: 一次上下文采集后，未知任务进入通用 LLM 回退
 2. 矿工分工: 一名工人采石、其余采矿，不出现两人都采石
 3. 升级顺序: 第1天武器升级优先；第2天围墙升级优先，围墙升完再武器
 """
@@ -16,7 +15,7 @@ from test_strategy import fixture, unit
 from agent.brain import Planner, decide_response, wall_sites
 from agent.memory import Memory
 from agent.protocol import Turn, Pos, distance
-from agent.tasks import PROBES, PROBE_LIMIT, HERITAGE_API_KEY, TASK_DIR
+from agent import templates
 
 
 def task_payload():
@@ -52,58 +51,42 @@ def two_worker_payload(day=1, gold=200, zones=None):
 
 
 class ProbeTests(unittest.TestCase):
-    def test_first_probe_targets_task_dir_without_root_recursion(self):
-        probe = PROBES[0]
-        self.assertIn('find', probe)
-        self.assertIn(TASK_DIR, probe)
-        # 禁止从根目录全盘递归（会拖爆 15 秒沙盒限制）
-        self.assertNotIn('find / ', probe)
-        self.assertNotIn("find / ", PROBES[1])
-        for probe in PROBES:
-            self.assertIn(TASK_DIR, probe)
-            self.assertNotIn("-maxdepth 99", probe)
-
-    def test_three_fixed_probes_then_knowledge_prompt(self):
+    def test_one_context_command_then_generic_fallback(self):
         p = task_payload()
-        p['phaseTask'] = '【自进化任务】调用遗产接口查询文物编号'
+        p['phaseTask'] = '【自进化任务】调用未知接口查询文物编号'
         m = Memory()
-        rounds = []
-        n = 1
-        for _ in range(10):
-            p['roundNo'] = n
-            r = decide_response(p, m)
-            if r['prompt']:
-                rounds.append(('prompt', r['prompt']))
-                break
-            self.assertTrue(r['executeCmd'], r)
-            rounds.append(('probe', r['executeCmd']))
-            p['lastCmdResult'] = '[exitCode:0]\nfile: task.txt api=http://127.0.0.1:9/heritage'
-            n += 1
-        probes = [c for kind, c in rounds if kind == 'probe']
-        self.assertEqual(len(probes), PROBE_LIMIT, probes)
-        self.assertEqual(probes, list(PROBES))
-        prompt = rounds[-1][1]
-        # 知识型 prompt: 带上前 3 轮探测结果, 并要求带鉴权头的 API 调用
-        self.assertIn('probe_results', prompt)
-        self.assertIn(HERITAGE_API_KEY, prompt)
-        self.assertIn('curl', prompt)
-        self.assertIn('参数组合', prompt)
-        self.assertEqual(m.llm_used, 0)      # 任务期不占每日额度
+        first = decide_response(p, m)
+        self.assertEqual(first['executeCmd'], templates.locate_command(p['phaseTask']))
+        self.assertFalse(first['prompt'])
+        p['roundNo'] = 2
+        p['lastCmdResult'] = '[exitCode:0]\nUNIQUE_CONTEXT_MARKER'
+        second = decide_response(p, m)
+        self.assertFalse(second['executeCmd'])
+        self.assertIn('UNIQUE_CONTEXT_MARKER', second['prompt'])
+        self.assertIn(p['phaseTask'], second['prompt'])
+        self.assertEqual(m.llm_used, 0)
 
-    def test_probe_output_forwarded_to_llm(self):
+    def test_context_failure_goes_to_llm_without_probe_loop(self):
         p = task_payload()
-        p['phaseTask'] = '读文件任务'
+        p['phaseTask'] = '请阅读 task_missing.md'
         m = Memory()
-        n = 1
-        for _ in range(PROBE_LIMIT):
-            p['roundNo'] = n
-            decide_response(p, m)
-            self.assertIn('selfEvolutionTask', m.task['history'][-1]['command'])
-            p['lastCmdResult'] = '[exitCode:0]\nUNIQUE_PROBE_MARKER_%d' % n
-            n += 1
-        p['roundNo'] = n
-        r = decide_response(p, m)
-        self.assertIn('UNIQUE_PROBE_MARKER_%d' % (n - 1), r['prompt'])
+        decide_response(p, m)
+        p['roundNo'] = 2
+        p['lastCmdResult'] = '__TASK_ERROR "FileNotFoundError"'
+        response = decide_response(p, m)
+        self.assertTrue(response['prompt'])
+        self.assertFalse(response['executeCmd'])
+
+    def test_latest_command_result_is_in_fallback_prompt(self):
+        p = task_payload()
+        p['phaseTask'] = '未知任务'
+        m = Memory()
+        decide_response(p, m)
+        p['roundNo'] = 2
+        p['lastCmdResult'] = 'fresh context'
+        response = decide_response(p, m)
+        self.assertIn('fresh context', response['prompt'])
+        self.assertIn('latest_result', response['prompt'])
 
 
 class MiningRoleTests(unittest.TestCase):
