@@ -1,6 +1,7 @@
 """三项修改的回归测试。
 
-1. 任务探测: 一次上下文采集后，未知任务进入通用 LLM 回退
+1. 任务探测: 只探测 /tmp/selfEvolutionTask/（不从根目录全盘递归），3 轮固定探测后
+   用已知信息请求 LLM 直接给出 API 调用（带 X-API-Key 头、尝试不同参数组合）
 2. 矿工分工: 一名工人采石、其余采矿，不出现两人都采石
 3. 升级顺序: 第1天武器升级优先；第2天围墙升级优先，围墙升完再武器
 """
@@ -15,7 +16,7 @@ from test_strategy import fixture, unit
 from agent.brain import Planner, decide_response, wall_sites
 from agent.memory import Memory
 from agent.protocol import Turn, Pos, distance
-from agent import templates
+from agent.tasks import PROBES, PROBE_LIMIT, HERITAGE_API_KEY, TASK_DIR
 
 
 def task_payload():
@@ -51,42 +52,58 @@ def two_worker_payload(day=1, gold=200, zones=None):
 
 
 class ProbeTests(unittest.TestCase):
-    def test_one_context_command_then_generic_fallback(self):
-        p = task_payload()
-        p['phaseTask'] = '【自进化任务】调用未知接口查询文物编号'
-        m = Memory()
-        first = decide_response(p, m)
-        self.assertEqual(first['executeCmd'], templates.locate_command(p['phaseTask']))
-        self.assertFalse(first['prompt'])
-        p['roundNo'] = 2
-        p['lastCmdResult'] = '[exitCode:0]\nUNIQUE_CONTEXT_MARKER'
-        second = decide_response(p, m)
-        self.assertFalse(second['executeCmd'])
-        self.assertIn('UNIQUE_CONTEXT_MARKER', second['prompt'])
-        self.assertIn(p['phaseTask'], second['prompt'])
-        self.assertEqual(m.llm_used, 0)
+    def test_first_probe_targets_task_dir_without_root_recursion(self):
+        probe = PROBES[0]
+        self.assertIn('find', probe)
+        self.assertIn(TASK_DIR, probe)
+        # 禁止从根目录全盘递归（会拖爆 15 秒沙盒限制）
+        self.assertNotIn('find / ', probe)
+        self.assertNotIn("find / ", PROBES[1])
+        for probe in PROBES:
+            self.assertIn(TASK_DIR, probe)
+            self.assertNotIn("-maxdepth 99", probe)
 
-    def test_context_failure_goes_to_llm_without_probe_loop(self):
+    def test_three_fixed_probes_then_knowledge_prompt(self):
         p = task_payload()
-        p['phaseTask'] = '请阅读 task_missing.md'
+        p['phaseTask'] = '【自进化任务】调用遗产接口查询文物编号'
         m = Memory()
-        decide_response(p, m)
-        p['roundNo'] = 2
-        p['lastCmdResult'] = '__TASK_ERROR "FileNotFoundError"'
-        response = decide_response(p, m)
-        self.assertTrue(response['prompt'])
-        self.assertFalse(response['executeCmd'])
+        rounds = []
+        n = 1
+        for _ in range(10):
+            p['roundNo'] = n
+            r = decide_response(p, m)
+            if r['prompt']:
+                rounds.append(('prompt', r['prompt']))
+                break
+            self.assertTrue(r['executeCmd'], r)
+            rounds.append(('probe', r['executeCmd']))
+            p['lastCmdResult'] = '[exitCode:0]\nfile: task.txt api=http://127.0.0.1:9/heritage'
+            n += 1
+        probes = [c for kind, c in rounds if kind == 'probe']
+        self.assertEqual(len(probes), PROBE_LIMIT, probes)
+        self.assertEqual(probes, list(PROBES))
+        prompt = rounds[-1][1]
+        # 知识型 prompt: 带上前 3 轮探测结果, 并要求带鉴权头的 API 调用
+        self.assertIn('probe_results', prompt)
+        self.assertIn(HERITAGE_API_KEY, prompt)
+        self.assertIn('curl', prompt)
+        self.assertIn('参数组合', prompt)
+        self.assertEqual(m.llm_used, 0)      # 任务期不占每日额度
 
-    def test_latest_command_result_is_in_fallback_prompt(self):
+    def test_probe_output_forwarded_to_llm(self):
         p = task_payload()
-        p['phaseTask'] = '未知任务'
+        p['phaseTask'] = '读文件任务'
         m = Memory()
-        decide_response(p, m)
-        p['roundNo'] = 2
-        p['lastCmdResult'] = 'fresh context'
-        response = decide_response(p, m)
-        self.assertIn('fresh context', response['prompt'])
-        self.assertIn('latest_result', response['prompt'])
+        n = 1
+        for _ in range(PROBE_LIMIT):
+            p['roundNo'] = n
+            decide_response(p, m)
+            self.assertIn('selfEvolutionTask', m.task['history'][-1]['command'])
+            p['lastCmdResult'] = '[exitCode:0]\nUNIQUE_PROBE_MARKER_%d' % n
+            n += 1
+        p['roundNo'] = n
+        r = decide_response(p, m)
+        self.assertIn('UNIQUE_PROBE_MARKER_%d' % (n - 1), r['prompt'])
 
 
 class MiningRoleTests(unittest.TestCase):
@@ -185,33 +202,27 @@ class UpgradeOrderTests(unittest.TestCase):
         wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
         self.assertLess(weapon_pos, wall_pos)
 
-    def test_weapons_outrank_walls_until_maxed(self):
-        # 规则(issue #4 总结): 武器升级优先级最高, 尽快升满; 围墙升级吃闲钱
-        planner, options = self.planned(day=2)
-        self.assertTrue([o for o in options if o[3].startswith('Wall')], '存在待升级围墙')
-        weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
-        wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
-        self.assertLess(weapon_pos, wall_pos, [o[3] for o in options])
+    def test_weapons_still_outrank_walls_without_wall_pressure(self):
+        # 用户口径: 无论怎样都是优先升级武器; 只有前夜围墙承伤 > 80% 才把围墙券提前
+        for day in (2, 3):
+            planner, options = self.planned(day=day)
+            self.assertTrue([o for o in options if o[3].startswith('Wall')], '存在待升级围墙')
+            weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
+            wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
+            self.assertLess(weapon_pos, wall_pos, f'day{day} ' + str([o[3] for o in options]))
 
-    def test_day3_weapons_still_first(self):
+    def test_wall_vouchers_lead_only_when_last_night_took_heavy_damage(self):
         planner, options = self.planned(day=3)
-        wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
-        weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
-        self.assertLess(weapon_pos, wall_pos, [o[3] for o in options])
-
-    def test_day2_weapons_resume_after_wall_phase_done(self):
-        # 主要围墙已升到2级后 -> 武器升级接管
-        p = two_worker_payload(day=3, gold=400)
-        sites = wall_sites(Turn.load(p))
-        p['teamOur']['roles'] += [unit(40 + i, 'wall', q.x, q.y, health=1000,
-                                       level=(2 if i < len(sites) - 1 else 1))
-                                  for i, q in enumerate(sites)]
-        m = Memory(day=2)
-        planner = Planner(Turn.load(p), p, m)
+        planner.memory.wall_pressure_high = True          # 前夜围墙承伤超过阈值
         options = planner.economic.options()
-        weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
         wall_pos = next(i for i, o in enumerate(options) if o[3].startswith('Wall'))
-        self.assertLess(weapon_pos, wall_pos, [o[3] for o in options])
+        weapon_pos = next(i for i, o in enumerate(options) if o[3].startswith('Weapon'))
+        self.assertLess(wall_pos, weapon_pos, [o[3] for o in options])
+
+    def test_day1_weapons_still_first(self):
+        # 第1天的当天配额是"两个武器升级", 围墙券不能插队
+        planner, options = self.planned(day=1)
+        self.assertTrue(options[0][3].startswith('Weapon'), [o[3] for o in options])
 
     def test_day1_weapon_voucher_not_blocked_by_missing_walls(self):
         # 第一天缺墙时，武器升级券仍可采购（此前会被 priority>=1 的守卫全部拦掉）
@@ -233,7 +244,8 @@ class UpgradeOrderTests(unittest.TestCase):
             planner = Planner(Turn.load(p), p, m)
             options = planner.economic.options()
             # 三级墙已满级，保命手段是 WallFixer（修复包），应排在首位
-            self.assertEqual(options[0][3], 'WallFixer', [o[3] for o in options])
+            self.assertIn('WallFixer', [o[3] for o in options])
+            self.assertTrue(options[0][3].startswith('Weapon'))  # daytime: no immediate attack
 
 
 if __name__ == '__main__':

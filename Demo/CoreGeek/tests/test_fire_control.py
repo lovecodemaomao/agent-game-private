@@ -140,10 +140,11 @@ class OperatorsTests(unittest.TestCase):
                                   unit(3,'worker',7,17,backpack=['WallFixer']),
                                   unit(10,'rocket',8,14,cooldown=2),
                                   unit(11,'rocket',8,18,cooldown=2),
-                                  unit(40,'wall',8,16,health=100)]
+                                  unit(40,'wall',8,16,health=30)]
+        p['robot']['roles'] = [unit(90,'bossRobot',9,16,health=800,targetTeam='challenger')]
         result = decide_response(p, Memory())['roleCommandMap']
         self.assertEqual(sum(c['action']=='use' for c in result.values()), 1)
-        self.assertFalse(any(c['action']=='move' for c in result.values()))
+        self.assertFalse(any(c.get('controllerId')==uid for uid,c in result.items() if c['action']=='use'))
 
 
 if __name__ == '__main__':

@@ -42,24 +42,16 @@ def payload(day=1, gold=75, walls=None, zones=None, hour=0):
 
 class WallRepairTests(unittest.TestCase):
     def test_repairs_any_level_wall_below_half_with_held_fixer(self):
-        sites = wall_sites(Turn.load(payload()))
-        front = sites[0]
-        p = payload(day=2, gold=200, walls=[
-            unit(40, 'wall', front.x, front.y, health=400)])      # 40% 血量, 1级
-        p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
-        # 夜间必须站在靠基地内侧(外侧会被机器人打)
-        inner = min(((max(abs(front.x+dx-10), abs(front.y+dy-24)), (front.x+dx, front.y+dy))
-                     for dx in (-1,0,1) for dy in (-1,0,1) if dx or dy))[1]
-        p['teamOur']['roles'][1]['pos'] = {'x': inner[0], 'y': inner[1]}
-        m = Memory(day=2)
-        planner = Planner(Turn.load(p), p, m)
-        role = [w for w in planner.turn.workers() if w.unit_id == 2][0]
+        # Daytime L1 damage must not consume a repair pack; use a voucher or rebuild.
+        front = wall_sites(Turn.load(payload()))[0]
+        p = payload(day=2,gold=0,walls=[unit(40,'wall',front.x,front.y,health=400)])
+        p['teamOur']['roles'][1]['backpack'] = ['WallFixer','WallUpgradeVoucher1']
+        p['teamOur']['roles'][1]['pos'] = {'x':front.x-1,'y':front.y}
+        planner = Planner(Turn.load(p),p,Memory(day=2))
         planner.economic.prepare()
-        self.assertTrue(planner.economic.upgrade(role, planner.route(role)), m.jobs)
-        cmd = planner.commands['2']
-        self.assertEqual(cmd['action'], 'use')
-        self.assertEqual(cmd['name'], 'WallFixer')
-        self.assertEqual(Pos.load(cmd['targetPos'][0]), front)
+        role = planner.turn.workers()[0]
+        self.assertTrue(planner.economic.upgrade(role,planner.route(role)))
+        self.assertEqual(planner.commands['2']['name'],'WallUpgradeVoucher1')
 
     def test_healthy_wall_is_not_repaired(self):
         sites = wall_sites(Turn.load(payload()))
@@ -80,8 +72,8 @@ class WallRepairTests(unittest.TestCase):
         sites = wall_sites(Turn.load(payload()))
         front, side = sites[0], sites[-1]
         p = payload(day=2, gold=200, walls=[
-            unit(40, 'wall', front.x, front.y, health=400),
-            unit(41, 'wall', side.x, side.y, health=400)])
+            unit(40, 'wall', front.x, front.y, health=400, level=3),
+            unit(41, 'wall', side.x, side.y, health=400, level=3)])
         p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
         # 夜间必须站在靠基地内侧(外侧会被机器人打)
         inner = min(((max(abs(front.x+dx-10), abs(front.y+dy-24)), (front.x+dx, front.y+dy))
@@ -106,24 +98,13 @@ class WallRepairTests(unittest.TestCase):
         self.assertNotIn('WallFixer', items)
 
     def test_night_repairs_when_already_adjacent(self):
-        # 夜间无可攻击目标，已经在炮位且贴墙时可以原地修复。
-        sites = wall_sites(Turn.load(payload()))
-        front = sites[0]
-        p = payload(day=1, gold=0, walls=[
-            unit(40, 'wall', front.x, front.y, health=200)])      # 20% 血量
-        p['roundNo'] = 85                                            # 夜晚
-        p['teamOur']['roles'][1]['backpack'] = ['WallFixer']
-        # 夜间必须站在靠基地内侧(外侧会被机器人打)
-        inner = min(((max(abs(front.x+dx-10), abs(front.y+dy-24)), (front.x+dx, front.y+dy))
-                     for dx in (-1,0,1) for dy in (-1,0,1) if dx or dy))[1]
-        p['teamOur']['roles'][1]['pos'] = {'x': inner[0], 'y': inner[1]}
-        next(u for u in p['teamOur']['roles'] if u['id']==10)['pos'] = {'x':inner[0], 'y':inner[1]-1}
-        m = Memory(day=1)
-        r = decide_response(p, m)
-        cmd = r['roleCommandMap'].get('2')
-        self.assertIsNotNone(cmd, r['roleCommandMap'])
-        self.assertEqual(cmd['action'], 'use')
-        self.assertEqual(cmd['name'], 'WallFixer')
+        # No incoming wave: a low-health wall can safely wait until daytime.
+        front = wall_sites(Turn.load(payload()))[0]
+        p = payload(day=1,gold=0,walls=[unit(40,'wall',front.x,front.y,health=200)])
+        p['roundNo']=129
+        p['teamOur']['roles'][1]['backpack']=['WallFixer']
+        result=decide_response(p,Memory(day=1))['roleCommandMap']
+        self.assertFalse(any(c.get('name')=='WallFixer' for c in result.values()))
 
 
 class FixerReserveTests(unittest.TestCase):

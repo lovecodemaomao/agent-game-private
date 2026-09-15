@@ -7,7 +7,6 @@ from agent.memory import Memory
 from agent.runtime import Agent
 from agent.protocol import Turn,Pos,distance
 from agent.tasks import Tasks
-from agent import templates
 
 
 def task_fixture():
@@ -73,7 +72,7 @@ class TaskTests(unittest.TestCase):
                 p['roundNo']=n+1;p['lastCmdResult']=''
                 p['llmResp']=llm_reply(m,kind='command',command=command,skill='复用输入解析与求解方法')
                 r=decide_response(p,m)
-                self.assertEqual(r['executeCmd'],templates.command('llm',script=command))
+                self.assertEqual(r['executeCmd'],command)
                 self.assertFalse(r['prompt'])
                 p['roundNo']=n+2;p['llmResp']='';p['lastCmdResult']=output
                 r=decide_response(p,m)
@@ -175,21 +174,29 @@ class TaskTests(unittest.TestCase):
 
 class EconomyTests(unittest.TestCase):
     def test_procurement_stays_committed_and_confirms_use(self):
-        p=developed();m=Memory();upgraded=False;actions=[]
+        p=developed();m=Memory();upgraded=False;actions=[];per_role={}
         for n in range(131,155):
             p['roundNo']=n;r=decide_response(p,m)
             roles={str(u['id']):u for u in p['teamOur']['roles']}
             for uid,c in r['roleCommandMap'].items():
                 if c['action']=='move': roles[uid]['pos']=c['targetPos'][0]
                 elif c['action']=='buy':
-                    actions.append('buy');roles[uid]['backpack'].append(c['name'])
+                    actions.append('buy');per_role.setdefault(uid,[]).append('buy')
+                    roles[uid]['backpack'].append(c['name'])
                     p['teamOur']['goldNum']-=next(x['price'] for x in p['weaponShopList'] if x['name']==c['name'])
                 elif c['action']=='use':
-                    actions.append('use');roles[uid]['backpack'].remove(c['name'])
+                    actions.append('use');per_role.setdefault(uid,[]).append('use')
+                    roles[uid]['backpack'].remove(c['name'])
                     target=next(u for u in p['teamOur']['roles'] if u['pos']==c['targetPos'][0])
                     target['level']+=1;upgraded=True
             if upgraded: break
-        self.assertTrue(upgraded);self.assertEqual(actions,['buy','use'])
+        self.assertTrue(upgraded)
+        # 采购一旦承诺就坚持送达并确认使用: 下单的那个角色必须完成 buy -> use
+        # (开拓者也会在商店旁待命并按计划买券, 所以同期可能有多笔并行采购)
+        couriers=[uid for uid,seq in per_role.items() if 'buy' in seq]
+        self.assertTrue(couriers,per_role)
+        self.assertEqual(per_role[couriers[0]][:2],['buy','use'],per_role)
+        self.assertTrue(any('use' in seq for seq in per_role.values()),per_role)
 
     def test_wall_upgrade_candidates_and_dusk_use(self):
         p=developed();p['roundNo']=200

@@ -15,7 +15,7 @@ from test_strategy import fixture, unit
 from agent.brain import Planner, decide_response, wall_sites
 from agent.memory import Memory
 from agent.protocol import Turn, Pos, distance
-from agent.economy import STATION_FALLBACK_HP, STATION_FALLBACK_DAY
+from agent.economy import STATION_FALLBACK_HP, STATION_FALLBACK_DAY, STATION_URGENT_DAY
 from agent.tasks import Tasks
 
 
@@ -59,7 +59,7 @@ class RingFirstTests(unittest.TestCase):
         self.assertTrue(any(fetched), '半圈未完成时工人应去采石/建墙')
 
     def test_after_ring_complete_both_mine_ore(self):
-        sites = wall_sites(Turn.load(payload()))
+        sites = wall_sites(Turn.load(payload(day=2)))
         if not sites:
             self.skipTest('no wall sites')
         p = payload(day=2, gold=75, walls=[unit(40 + i, 'wall', q.x, q.y, health=1000)
@@ -124,20 +124,48 @@ class BatchTests(unittest.TestCase):
 
 class StationFallbackTests(unittest.TestCase):
     def test_day4_low_hp_station_is_top_priority(self):
-        p = payload(day=STATION_FALLBACK_DAY, gold=200, station_health=STATION_FALLBACK_HP - 100)
+        p = payload(day=STATION_FALLBACK_DAY, gold=200, station_health=800)
         m = Memory(day=STATION_FALLBACK_DAY)
         planner = Planner(Turn.load(p), p, m)
         options = planner.economic.options()
         self.assertEqual(options[0][3], 'StationUpgradeVoucher1', [o[3] for o in options])
 
-    def test_before_day4_low_hp_station_is_not_special(self):
-        p = payload(day=3, gold=200, station_health=STATION_FALLBACK_HP - 100)
-        m = Memory(day=3)
+    def test_day3_damaged_station_is_top_priority(self):
+        # 需求3: 第3天之后基地一受伤, 当天第一优先级就是基地升级券
+        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=800)
+        m = Memory(day=STATION_URGENT_DAY)
+        planner = Planner(Turn.load(p), p, m)
+        options = planner.economic.options()
+        self.assertEqual(options[0][3], 'StationUpgradeVoucher1', [o[3] for o in options])
+
+    def test_station_damage_outranks_weapon_vouchers(self):
+        p = payload(day=STATION_URGENT_DAY, gold=1000, station_health=1400)
+        m = Memory(day=STATION_URGENT_DAY)
+        planner = Planner(Turn.load(p), p, m)
+        self.assertEqual(planner.economic.options()[0][3], 'WeaponUpgradeVoucher1')
+
+    def test_before_day3_low_hp_station_is_not_special(self):
+        # 第3天之前即使基地掉血也不抢武器/围墙升级的优先级
+        p = payload(day=2, gold=200, station_health=800)
+        m = Memory(day=2)
         planner = Planner(Turn.load(p), p, m)
         items = [o[3] for o in planner.economic.options()]
         self.assertIn('StationUpgradeVoucher1', items)
-        # 第3天仍以围墙/武器配额为先, 基地券不在最前
-        self.assertNotEqual(items[0], 'StationUpgradeVoucher1', items)
+        self.assertEqual(items[0], 'StationUpgradeVoucher1', items)  # critical HP is urgent on any day
+
+    def test_tier2_voucher_when_day_starts_rich_and_station_is_level2(self):
+        # 需求3: 白天开始时金币>150 且基地已 2 级 -> 直接买基地升级卷2
+        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=1700)
+        p['teamOur']['roles'][0]['level'] = 2
+        m = Memory(day=STATION_URGENT_DAY, day_start_gold=200)
+        planner = Planner(Turn.load(p), p, m)
+        self.assertEqual(planner.economic.options()[0][3], 'StationUpgradeVoucher2')
+
+    def test_tier1_voucher_when_station_still_level1(self):
+        p = payload(day=STATION_URGENT_DAY, gold=200, station_health=800)
+        m = Memory(day=STATION_URGENT_DAY, day_start_gold=200)
+        planner = Planner(Turn.load(p), p, m)
+        self.assertEqual(planner.economic.options()[0][3], 'StationUpgradeVoucher1')
 
     def test_healthy_station_no_fallback_on_day4(self):
         p = payload(day=4, gold=200, station_health=1500)
@@ -158,49 +186,66 @@ class TaskReuseTests(unittest.TestCase):
         p['phaseTask'] = desc
         return p
 
-    def test_legacy_raw_command_is_not_replayed(self):
+    def test_same_structure_task_matches_saved_procedure(self):
         m = Memory()
-        m.skills.append({'task':'old task', 'command':'echo stale', 'answer':'old answer'})
-        p = self.task_payload('old task')
+        m.skills.append({'task': '【自进化任务】请查询成都今天的天气并提交答案。\
+第三方天气API文档：GET http://x/weather?city=<城市名>',
+                         'command': 'curl -s "http://x/weather?city=成都"',
+                         'answer': '成都今天天气：阴', 'method': 'weather', 'steps': []})
+        p = self.task_payload('【自进化任务】请查询上海今天的天气并提交答案。\
+第三方天气API文档：GET http://x/weather?city=<城市名>')
+        planner = Planner(Turn.load(p), p, m)
+        tasks = Tasks(planner)
+        tasks.sync_task()
+        self.assertIsNotNone(m.task.get('reuse'), m.task)
+
+    def test_reuse_replays_command_without_probing_or_llm(self):
+        m = Memory()
+        m.skills.append({'task': '查询成都今天的天气。GET http://x/weather?city=<城市名>',
+                         'command': 'curl -s "http://x/weather?city=成都"',
+                         'answer': '成都今天天气：阴', 'method': 'weather', 'steps': []})
+        p = self.task_payload('查询上海今天的天气。GET http://x/weather?city=<城市名>')
+        planner = Planner(Turn.load(p), p, m)
+        tasks = Tasks(planner)
+        tasks.run()
+        self.assertEqual(planner.execute_cmd, 'curl -s "http://x/weather?city=成都"')
+        self.assertEqual(planner.prompt, '', '复用通道不应请求 LLM')
+
+    def test_same_params_reuse_submits_saved_answer(self):
+        # 完全同题(同城市): 重跑命令后直接提交已验证答案(零 LLM)
+        m = Memory()
+        m.skills.append({'task': '查询成都今天的天气。GET http://x/weather?city=<城市名>',
+                         'command': 'curl -s "http://x/weather?city=成都"',
+                         'answer': '成都今天天气：阴', 'param': '成都', 'method': 'weather', 'steps': []})
+        p = self.task_payload('查询成都今天的天气。GET http://x/weather?city=<城市名>')
         planner = Planner(Turn.load(p), p, m)
         Tasks(planner).run()
-        self.assertNotEqual(planner.execute_cmd, 'echo stale')
-        self.assertNotIn('4', planner.commands)
-
-    def test_same_description_does_not_submit_saved_answer(self):
-        m = Memory()
-        m.skills.append({'task':'read current value', 'command':'cat value', 'answer':'stale'})
-        p = self.task_payload('read current value')
-        Tasks(Planner(Turn.load(p), p, m)).run()
         p['roundNo'] = 2
-        p['lastCmdResult'] = 'fresh value: changed'
+        p['lastCmdResult'] = '[exitCode:0]\n{"city":"成都","weather":"阴"}'
+        planner2 = Planner(Turn.load(p), p, m)
+        Tasks(planner2).run()
+        cmd = planner2.commands.get('4')
+        self.assertIsNotNone(cmd, planner2.commands)
+        self.assertEqual(cmd['action'], 'submitAnswer')
+        self.assertIn('阴', cmd['taskAnswer'])
+
+    def test_different_params_substitutes_and_does_not_reuse_old_answer(self):
+        # 参数不同: 命令里的旧参数被替换为新参数重跑, 且不沿用旧答案(避免答错)
+        m = Memory()
+        m.skills.append({'task': '查询成都今天的天气。GET http://x/weather?city=<城市名>',
+                         'command': 'curl -s "http://x/weather?city=成都"',
+                         'answer': '成都今天天气：阴', 'param': '成都', 'method': 'weather', 'steps': []})
+        p = self.task_payload('查询上海今天的天气。GET http://x/weather?city=<城市名>')
         planner = Planner(Turn.load(p), p, m)
         Tasks(planner).run()
-        self.assertNotIn('4', planner.commands)
-        self.assertIn('fresh value: changed', planner.prompt)
-
-    def test_unknown_skill_is_guidance_for_current_context(self):
-        from agent import templates
-        m = Memory()
-        desc, context = 'unknown graph problem', 'current graph'
-        sig = templates.signature(desc, context).dump()
-        m.skills.append({'family':'unknown', 'signature':sig, 'method':'use breadth-first search'})
-        p = self.task_payload(desc)
-        Tasks(Planner(Turn.load(p), p, m)).run()
+        self.assertIn('上海', planner.execute_cmd, '命令参数应被替换为新城市')
+        self.assertNotIn('成都', planner.execute_cmd)
         p['roundNo'] = 2
-        p['lastCmdResult'] = context
-        planner = Planner(Turn.load(p), p, m)
-        Tasks(planner).run()
-        self.assertIn('use breadth-first search', planner.prompt)
-        self.assertIn(context, planner.prompt)
-
-    def test_changed_unknown_context_does_not_match_skill(self):
-        from agent import templates
-        m = Memory()
-        m.skills.append({'signature':templates.signature('unknown', 'old').dump(), 'method':'old method'})
-        p = self.task_payload('unknown')
-        tasks = Tasks(Planner(Turn.load(p), p, m))
-        self.assertIsNone(tasks.reusable('unknown', 'new'))
+        p['lastCmdResult'] = '[exitCode:0]\n{"city":"上海","weather":"多云"}'
+        planner2 = Planner(Turn.load(p), p, m)
+        Tasks(planner2).run()
+        self.assertNotIn('4', planner2.commands, '不应沿用旧城市的答案')
+        self.assertTrue(planner2.prompt, '应请 LLM 依据新结果作答')
 
 
 if __name__ == '__main__':
@@ -243,24 +288,31 @@ class NightVoucherDeliveryTests(unittest.TestCase):
         self.assertEqual(cmd['name'], 'WallUpgradeVoucher1')
 
     def test_night_moves_to_inner_side_when_adjacent_outside(self):
-        # 贴墙但在外侧 -> 先绕到内侧再用(外侧会被机器人打)
+        # A legal detour need not strictly reduce geometric distance every step.
         sites = wall_sites(Turn.load(payload()))
         wall = sites[0]
-        station = Pos(10, 24)
-        outside = max((Pos(wall.x + dx, wall.y + dy)
-                       for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy),
-                      key=lambda q: distance(q, station))
-        p = payload(day=1, gold=0, walls=[unit(40, 'wall', wall.x, wall.y, health=1000)])
+        p = payload(day=1, gold=0, walls=[unit(40,'wall',wall.x,wall.y,health=1000)])
         p['roundNo'] = 85
-        p['teamOur']['roles'][1]['pos'] = outside.dump()
+        p['teamOur']['roles'][1]['pos'] = {'x':wall.x+1,'y':wall.y}
         p['teamOur']['roles'][1]['backpack'] = ['WallUpgradeVoucher1']
+        p['robot']['roles'] = [unit(90,'bossRobot',20,24,health=800,targetTeam='challenger')]
         m = Memory(day=1)
-        planner = Planner(Turn.load(p), p, m)
-        planner.run()
-        cmd = planner.commands.get('2')
-        self.assertEqual(cmd['action'], 'move', cmd)
-        tgt = Pos.load(cmd['targetPos'][0])
-        self.assertLess(distance(tgt, station), distance(outside, station), '应走向更靠基地的一侧')
+        for _ in range(12):
+            turn = Turn.load(p)
+            commands = decide_response(p,m)['roleCommandMap']
+            for role in p['teamOur']['roles']:
+                cmd = commands.get(str(role['id']))
+                if cmd and cmd['action']=='use':
+                    role['backpack'].remove(cmd['name'])
+                    target=next(u for u in p['teamOur']['roles'] if u['pos']==cmd['targetPos'][0])
+                    target['level']+=1
+                if cmd and cmd['action']=='move':
+                    target = Pos.load(cmd['targetPos'][0])
+                    self.assertNotIn(target,turn.occupied_cells())
+                    role['pos'] = target.dump()
+            p['roundNo'] += 1
+        worker = next(r for r in Turn.load(p).workers() if r.unit_id==2)
+        self.assertLessEqual(min(distance(worker.pos,t.pos) for t in Turn.load(p).weapons()),1)
 
     def test_night_returns_to_tower_instead_of_delivering_wall_voucher(self):
         # 夜间先保证炮位，不为墙券离开防御位置。

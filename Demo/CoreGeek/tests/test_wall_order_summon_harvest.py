@@ -86,6 +86,7 @@ class SummonOrderTests(unittest.TestCase):
         self.assertFalse([j for j in m.jobs.values() if j.get('item') == SUMMON_ORDER], m.jobs)
         # 武器全 2 级 + 围墙阶段完成 -> 才允许采购
         sites = wall_sites(Turn.load(p))
+        sites = [q for q in sites if q.x >= 10]  # an open rear corridor for shop access
         roles = [u for u in p['teamOur']['roles'] if u['roleType'] in ('rocket', 'railgun')]
         for u in roles:
             u['level'] = 2

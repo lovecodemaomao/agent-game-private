@@ -1,7 +1,7 @@
 """Exact obstacle-aware distances for multi-leg economic journeys."""
 from collections import deque
 from .grid import neighbours
-from .protocol import Pos
+from .protocol import Pos, distance, station_footprint
 
 INF = 10**6
 
@@ -38,3 +38,20 @@ class Geography:
 
     def to(self, target):
         return self.field(self.seats(target))
+
+
+# 夜战结束判定用的威胁半径(与火箭炮 1 级射程 10 对齐): 基地/炮位该半径内没有活机器人
+# 才算"阵前清空"。放在这里是为了让 brain(决策) 与 memory(跨回合去抖) 共用同一判定。
+THREAT_RADIUS = 10
+
+
+def battle_over(turn, radius=THREAT_RADIUS):
+    """阵前是否已经没有活着的机器人(以武器塔为锚点, 无塔时以基地占地为锚点)。"""
+    anchors = [t.pos for t in turn.weapons()]
+    if not anchors:
+        station = turn.station()
+        anchors = list(station_footprint(station.pos)) if station is not None else []
+    if not anchors:
+        return True
+    return not any(r.health > 0 and min(distance(r.pos, p) for p in anchors) <= radius
+                   for r in turn.robots)
