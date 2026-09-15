@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 import sys
 import time
+import subprocess
+import hashlib
 
 WAVES = [(30,4,0,0),(35,10,0,0),(40,15,3,0),(45,20,4,0),
          (50,20,4,1),(55,25,5,1),(57,27,5,2)]
@@ -26,9 +28,9 @@ def unit(uid,kind,x,y,health=1000,level=1,backpack=()):
 def scenario(day, packs=3, mirror=False):
     a,b,c = LEVELS[day-1]
     roles = [unit(1,'station',5,15,1500), unit(2,'worker',7,14,220),
-             unit(3,'worker',6,16,220),unit(4,'pioneer',7,16,200,backpack=['WallFixer']*packs),
+             unit(3,'worker',4,14,220),unit(4,'pioneer',7,16,200,backpack=['WallFixer']*packs),
              unit(10,'rocket',7,13,1000,a),unit(11,'rocket',7,15,1000,b),
-             unit(12,'railgun',5,16,1000,c)]
+             unit(12,'railgun',4,13,1000,c)]
     # Identical defensive fixture for old/new. Four front walls in day1,
     # half ring day2, complete L2 ring day3+, including a permanently L1 gate.
     ring = [(x,y) for x in range(3,9) for y in range(12,18)
@@ -59,6 +61,7 @@ def run_case(day,packs,mirror,respond,api,ballistics):
                    clear_round=None,rocket_shots=0,railgun_shots=0,wall_damage=0,
                    walls_destroyed=0,station_damage=0,wall_fixer_used=0,
                    combat_mode_switch_round=None,max_decision_ms=0)
+    metrics.update(effective_damage=0,overkill=0,station_hp=1500)
     for tick in range(60):
         turn = api.Turn.load(p)
         start = time.perf_counter(); response = respond(p)
@@ -79,6 +82,7 @@ def run_case(day,packs,mirror,respond,api,ballistics):
                 assert controller in actors and controller not in used and controller not in commands
                 assert actors[controller]['roleType'] in ('worker','pioneer')
                 used.add(controller)
+                p['lastRoundRoleActionResults'][uid] = True
                 assert api.distance(api.Pos.load(actors[controller]['pos']),api.Pos.load(actor['pos'])) == 1
                 tower = next(t for t in turn.weapons() if str(t.unit_id)==uid)
                 assert tower.cooldown == 0
@@ -140,7 +144,10 @@ def run_case(day,packs,mirror,respond,api,ballistics):
                     robot_cells.remove(pos); robot_cells.add(nxt); r['pos'] = nxt.dump()
         # Simultaneous damage: even predicted-dead robots made their incoming attack.
         for r in p['robot']['roles']:
-            r['health'] = max(0,r['health']-predicted.get(r['id'],0))
+            damage=predicted.get(r['id'],0)
+            metrics['effective_damage']+=min(r['health'],damage)
+            metrics['overkill']+=max(0,damage-r['health'])
+            r['health'] = max(0,r['health']-damage)
         metrics['kills'] += sum(r['health']==0 for r in p['robot']['roles'])
         p['robot']['roles'] = [r for r in p['robot']['roles'] if r['health']>0]
         for uid,damage in incoming.items():
@@ -158,6 +165,7 @@ def run_case(day,packs,mirror,respond,api,ballistics):
             break
     metrics['remaining_robots_at_dawn']=len(p['robot']['roles'])
     metrics['station_alive']=next(u['health'] for u in p['teamOur']['roles'] if u['id']==1)>0
+    metrics['station_hp']=next(u['health'] for u in p['teamOur']['roles'] if u['id']==1)
     metrics['max_decision_ms']=round(metrics['max_decision_ms'],2)
     return metrics
 
@@ -167,6 +175,7 @@ def main():
     parser.add_argument('--source',default=str(Path(__file__).resolve().parents[1]/'src'))
     parser.add_argument('--output')
     parser.add_argument('--mirror',action='store_true')
+    parser.add_argument('--compare',help='Baseline JSON; block survival regressions under identical fixtures')
     args=parser.parse_args()
     sys.path.insert(0,str(Path(args.source).resolve()))
     api=importlib.import_module('agent.protocol'); fc=importlib.import_module('agent.fire_control')
@@ -180,9 +189,21 @@ def main():
             row['combat_mode_switch_round']=getattr(memory,'combat_switch_round',None)
             results.append(row)
             print(json.dumps(row),flush=True)
-    report={'assumptions':__doc__,'waves':WAVES,'levels':LEVELS,'results':results}
+    sha=subprocess.check_output(['git','-C',str(Path(args.source).resolve()),'rev-parse','HEAD'],text=True).strip()
+    source_root=Path(args.source).resolve()
+    source_hash=hashlib.sha256(b''.join(p.relative_to(source_root).as_posix().encode()+p.read_bytes()
+                              for p in sorted(source_root.rglob('*.py')))).hexdigest()
+    report={'assumptions':__doc__,'source_sha':sha,'source_hash':source_hash,
+            'waves':[list(w) for w in WAVES],'levels':[list(w) for w in LEVELS],'results':results}
     if args.output:
         Path(args.output).write_text(json.dumps(report,indent=2),encoding='utf-8')
+    if args.compare:
+        baseline=json.loads(Path(args.compare).read_text(encoding='utf-8'))
+        assert baseline['waves']==report['waves'] and baseline['levels']==report['levels']
+        before={(r['day'],r['packs'],r['mirror']):r for r in baseline['results']}
+        for row in results:
+            old=before[row['day'],row['packs'],row['mirror']]
+            assert not old['station_alive'] or row['station_alive'], ('survival regression',row)
 
 
 if __name__=='__main__': main()

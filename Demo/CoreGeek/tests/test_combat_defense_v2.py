@@ -8,7 +8,7 @@ from test_strategy import fixture, unit
 from test_fire_control import battle, robot
 from agent.brain import Planner, LOADOUT, decide_response, ring, wall_sites
 from agent.memory import Memory
-from agent.protocol import Turn, Pos
+from agent.protocol import Turn, Pos, distance
 from agent import fire_control as fc
 import pytest
 
@@ -180,7 +180,10 @@ def enclosed(rod=1,stone=True):
 
 
 def test_gate_rear_l1_open_confirm_close_before_night():
-    p,m=enclosed();pl=Planner(Turn.load(p),p,m);g=m.gate_pos
+    p,m=enclosed()
+    p['teamOur']['goldNum']=100
+    p['weaponShopList']=[{'name':'WeaponUpgradeVoucher1','price':100}]
+    pl=Planner(Turn.load(p),p,m);g=m.gate_pos
     assert g.x<pl.turn.station().pos.x
     assert pl.run()['2']['action']=='remove'
     assert m.gate_state=='opening'
@@ -194,6 +197,21 @@ def test_gate_rear_l1_open_confirm_close_before_night():
     assert m.gate_state=='closing'
     p['roundNo']+=1
     assert not any(c['action'] in ('build','remove') for c in Planner(Turn.load(p),p,m).run().values())
+
+
+def test_closed_gate_stays_closed_without_daytime_trip():
+    p,m=enclosed()
+    cmd=Planner(Turn.load(p),p,m).run()
+    assert not any(c['action']=='remove' for c in cmd.values())
+
+
+def test_rebuild_reassigned_when_original_worker_dies():
+    p=arena(140);p['teamOur']['roles'][1]['health']=0
+    p['teamOur']['roles'][2]['backpack']=['stone']*3
+    m=Memory(day=2);m.wall_rebuilds[2]=Pos(8,16)
+    pl=Planner(Turn.load(p),p,m);worker=pl.turn.workers()[0]
+    assert pl.economic.maintain_wall(worker,pl.route(worker))
+    assert 2 not in m.wall_rebuilds and m.wall_rebuilds[worker.unit_id]==Pos(8,16)
 
 
 def test_gate_never_seals_worker_outside():
@@ -292,6 +310,27 @@ def test_feasibility_reduces_for_cooldown_and_history():
     assert second['clear_ratio']<first['clear_ratio']
 
 
+@pytest.mark.parametrize('confirmed,loss,expected',[(True,40,[20]),(False,40,[]),(None,40,[]),(True,50,[])])
+def test_rocket_history_requires_attributed_observation(confirmed,loss,expected):
+    p=arena();p['robot']['roles']=[robot(100,12,13,hp=500)]
+    m=Memory();t=Turn.load(p);m.observe(t,p)
+    m.remember(t,{'roleCommandMap':{'10':{'action':'attack','controllerId':'2',
+                 'targetPos':[{'x':12,'y':13}]*2}}})
+    assert not m.rocket_hits
+    p['roundNo']+=1;p['robot']['roles'][0]['health']-=loss
+    p['lastRoundRoleActionResults']={} if confirmed is None else {'10':confirmed}
+    m.observe(Turn.load(p),p)
+    assert m.rocket_hits==expected
+    m.observe(Turn.load(p),p)
+    assert m.rocket_hits==expected
+
+
+def test_dense_chip_damage_does_not_justify_second_rocket():
+    p=arena();p['robot']['roles']=[robot(100+i,12,13+i,hp=800) for i in range(3)]
+    t=Turn.load(p);single={10:[Pos(12,14)]*2};double={**single,11:[Pos(12,14)]*2}
+    assert not fc.rocket_sync_value(t,t.weapons(),single,double)
+
+
 def test_dead_operator_cannot_be_controller():
     p=arena();p['teamOur']['roles'][1]['health']=0
     p['robot']['roles']=[robot(100,12,15,hp=40)]
@@ -323,12 +362,19 @@ def test_gate_does_not_upgrade_through_stale_delivery_job():
     assert m.jobs.get(2,{}).get('unit')!=wall.unit_id
 
 
-def test_day3_constructs_complete_ring_and_gate_with_available_stone():
+@pytest.mark.parametrize('mirror',[False,True])
+def test_day3_constructs_complete_ring_and_gate_with_available_stone(mirror):
     from test_strategy import apply_construction
     p=arena(261)
     p['teamOur']['roles']=[u for u in p['teamOur']['roles'] if u['roleType']!='wall']
     for u in p['teamOur']['roles']:
         if u['roleType']=='worker':u['backpack']=['stone']*25
+        # The legacy rail at (5,16) isolates the southeast interior pocket
+        # once the ring closes. A full-ring fixture needs connected seats.
+        if u['roleType']=='railgun':u['pos']={'x':4,'y':13}
+    if mirror:
+        for u in p['teamOur']['roles']:
+            u['pos']['x']=(39 if u['roleType']=='station' else 40)-u['pos']['x']
     m=Memory()
     for _ in range(70):
         commands=decide_response(p,m)['roleCommandMap']

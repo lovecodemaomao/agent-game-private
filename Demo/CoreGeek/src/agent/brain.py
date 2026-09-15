@@ -3,6 +3,7 @@
 Generic tasks use the judge LLM/sandbox channel; movement and economy stay local.
 """
 from collections import Counter
+from dataclasses import replace
 from itertools import permutations, combinations
 import math
 
@@ -184,8 +185,13 @@ class Planner:
         if not workers:
             return False
         rod = (self.turn.round_no-1)%130+1
-        # A closed gate is opened while there is useful daylight, by a worker.
-        if wall and rod < 50:
+        needs_exit = (any(self.base_distance(r.pos)>1 for r in roles)
+                      or bool(self.memory.jobs) or bool(self.memory.task)
+                      or any(self.base_distance(p)>2 and kind in
+                             ('stone','iron','copper','task','taskPoint')
+                             for p,kind in self.turn.zones.items())
+                      or bool(self.turn.gold and (self.prices or self.shop_prices)))
+        if wall and rod < 50 and needs_exit:
             worker = min(workers,key=lambda r:(self.route(r).distance(gate),r.unit_id))
             if wall.level == 1 and self.interact(worker,self.route(worker),gate,'remove',targetPos=[gate.dump()]):
                 self.engaged.add(worker.unit_id)
@@ -193,8 +199,15 @@ class Planner:
             return False
         paths = {r.unit_id:self.route(r) for r in roles}
         outside = [r for r in roles if self.base_distance(r.pos)>1]
-        home = {r.unit_id:min((paths[r.unit_id].cost.get(q,INF) for q in ring(self.turn,1)
-                              if q not in self.turn.blocked(r)),default=INF) for r in outside}
+        # A role waiting in the gate is a temporary reservation, not an
+        # unreachable map. Using INF here previously froze construction and
+        # oscillated the gate keeper as early as the first daytime turns.
+        structural_turn = replace(self.turn,ours=tuple(u for u in self.turn.ours
+                                  if u.kind not in ('worker','pioneer')))
+        home = {}
+        for r in outside:
+            budget_path = Routes(structural_turn,r,self.parking_cells())
+            home[r.unit_id] = min((budget_path.cost.get(q,INF) for q in ring(self.turn,1)),default=INF)
         return_now = rod >= min(60,70-max(home.values(),default=0)-len(roles)-2)
         if not return_now:
             return False
@@ -236,13 +249,30 @@ class Planner:
             if len(possible)==1:
                 seats |= possible
         for role in self.turn.alive(('pioneer',)):
-            if role.pos not in seats or str(role.unit_id) in self.commands:
+            if (role.pos not in seats and role.pos not in self.walls
+                    or str(role.unit_id) in self.commands):
                 continue
-            routes=self.route(role)
-            candidates=[q for q in inner-seats if q in routes.cost and q not in self.reserved]
+            routes=Routes(self.turn,role,self.reserved | self.build_targets)
+            candidates=[q for q in (inner-seats) | set(ring(self.turn,3))
+                        if q in routes.cost and q not in self.reserved]
             stand=min(candidates,key=lambda q:(routes.cost[q],q.x,q.y),default=None)
             if stand is not None and self.move(role,routes,stand):
                 self.engaged.add(role.unit_id)
+            elif stand is None:
+                # An operator can trap the pioneer in a corner's only build
+                # seat. Yield that operator first, then clear the pioneer on
+                # the next observed turn; never assume simultaneous movement.
+                for blocker in self.turn.controllable():
+                    if (blocker.unit_id == role.unit_id or distance(blocker.pos,role.pos)!=1
+                            or blocker.unit_id in self.engaged):
+                        continue
+                    path = Routes(self.turn,blocker,self.reserved | self.build_targets)
+                    exits = [q for q in (inner-seats) | set(ring(self.turn,3)) if q in path.cost and q != blocker.pos
+                             and q not in self.reserved]
+                    dest = min(exits,key=lambda q:(path.cost[q],q.x,q.y),default=None)
+                    if dest is not None and self.move(blocker,path,dest):
+                        self.engaged.add(blocker.unit_id)
+                        break
 
     def route(self, role):
         forbidden = set(self.reserved) | self.parking_cells()
@@ -915,12 +945,6 @@ class Planner:
                                                  'targetPos':[p.dump() for p in plan[t.unit_id]]}
                 used.add(r.unit_id)
                 self.memory.tower_assignments[r.unit_id] = t.unit_id
-                if t.kind == 'rocket':
-                    # Explicitly predicted per-missile effective hits, not attributed observations.
-                    total = sum(sum(min(x.health,combat.raw_damage(self.turn,t,p).get(x.robot_id,0))
-                                    for x in self.turn.robots if combat.our_target(self.turn,x)) for p in plan[t.unit_id])
-                    self.memory.rocket_hits.append(total/len(plan[t.unit_id]))
-                    self.memory.rocket_hits[:] = self.memory.rocket_hits[-combat.HIT_HISTORY_SIZE:]
         # Free roles can use adjacent upgrades without displacing an active gun.
         serviced = {best[4][1].unit_id} if best and best[4] else set()
         for r in roles:

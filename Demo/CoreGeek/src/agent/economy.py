@@ -171,6 +171,13 @@ class Economy:
         if not self.turn.is_day:
             return False
         rod = (self.turn.round_no-1)%130+1
+        workers = {w.unit_id:w for w in self.turn.workers()}
+        if role.unit_id not in self.m.wall_rebuilds and 'stone' in role.backpack:
+            for uid,pos in list(self.m.wall_rebuilds.items()):
+                owner = workers.get(uid)
+                if (owner is None or 'stone' not in owner.backpack) and routes.distance(pos)<10**6:
+                    self.m.wall_rebuilds[role.unit_id] = self.m.wall_rebuilds.pop(uid)
+                    break
         # Finish a previously observed demolition before taking any other job.
         pending = self.m.wall_rebuilds.get(role.unit_id)
         if pending is not None:
@@ -196,7 +203,10 @@ class Economy:
                 continue
             voucher = 'WallUpgradeVoucher1'
             delivery = any(j.get('unit')==wall.unit_id and j.get('item')==voucher
-                           and j.get('bought') for j in self.m.jobs.values())
+                           and j.get('bought') and uid in workers
+                           and voucher in workers[uid].backpack
+                           and self.p.route(workers[uid]).distance(wall.pos)+1<=71-rod
+                           for uid,j in self.m.jobs.items())
             if voucher in role.backpack or delivery:
                 continue
             reserve = int(self.p.day>=3 and not self.p.gate_wall())

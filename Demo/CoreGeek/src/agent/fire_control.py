@@ -366,20 +366,10 @@ def rocket_sync_value(turn, towers, single, double, context=None):
     first, both = metrics(single), metrics(double)
     if len(both) > len(first):
         return True
-    density = []
-    incoming = False
-    for t in towers:
-        if t.kind != 'rocket':
-            continue
-        for point in double.get(t.unit_id, ()):
-            targets = [r for r in turn.robots if r.health>0 and our_target(turn,r)
-                       and raw_damage(turn,t,point).get(r.robot_id,0)>0]
-            density.append(len(targets))
-            incoming |= any((target:=threatened_structure(turn,r)) is not None
-                            and structure_eta(turn,r,target)<=1 for r in targets)
-    # Dense or about-to-contact windows can justify simultaneous preparation,
-    # even before a high-HP target reaches a one-volley kill threshold.
-    return bool(density) and (min(density)>=3 or incoming)
+    context = context or combat_context(turn)
+    def removed_power(kills):
+        return sum(context['urgency'].get(uid,(0,0,0))[1] for uid in kills)
+    return removed_power(both) > removed_power(first)
 
 
 def select_targets(turn, tower, remaining):

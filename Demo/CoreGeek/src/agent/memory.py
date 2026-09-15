@@ -15,6 +15,7 @@ class Memory:
     clear_fail_rounds: int = 0
     combat_switch_round: int | None = None
     rocket_hits: list = field(default_factory=list)
+    pending_rocket_volley: dict | None = None
     gate_pos: object = None
     gate_state: str = 'open'
     gate_keeper: int | None = None
@@ -102,6 +103,7 @@ class Memory:
         return self.combat_mode
 
     def observe(self, turn, payload):
+        self.observe_rocket_volley(turn,payload)
         day = (turn.round_no - 1)//130 + 1
         if self.day != day:
             # The first dawn observation includes the final night's settlement.
@@ -263,6 +265,37 @@ class Memory:
             self.news_version += 1
         self.round_no = turn.round_no
 
+    def observe_rocket_volley(self, turn, payload):
+        """Only credit confirmed, isolated rocket damage in consecutive frames.
+
+        Action legality alone does not prove a hit. Require the observed HP
+        loss to equal our immutable ballistic prediction, and reject targets
+        shared with another weapon or enemy weapon in range. Missing units
+        are not attributed: disappearance alone does not establish our kill.
+        """
+        from .fire_control import HIT_HISTORY_SIZE
+        pending = self.pending_rocket_volley
+        self.pending_rocket_volley = None
+        if not pending or turn.round_no != pending['round']+1:
+            return
+        results = payload.get('lastRoundRoleActionResults') or {}
+        if not all(results.get(str(uid),results.get(uid)) is True for uid in pending['towers']):
+            return
+        robots = {r.robot_id:r for r in turn.robots}
+        total = 0
+        observed = False
+        for uid,(hp,damage) in pending['targets'].items():
+            robot = robots.get(uid)
+            if robot is None:
+                continue
+            loss = hp-max(0,robot.health)
+            if loss == min(hp,damage):
+                total += loss
+                observed = True
+        if observed:
+            self.rocket_hits.append(total/pending['missiles'])
+            self.rocket_hits[:] = self.rocket_hits[-HIT_HISTORY_SIZE:]
+
     def _track_wall_damage(self, turn):
         """需求6: 只在夜间统计围墙承伤 —— 掉血量 + 被打掉墙的剩余血量。
 
@@ -293,6 +326,28 @@ class Memory:
                 self.night_breach = True
 
     def remember(self, turn, response):
+        from .fire_control import raw_damage, our_target
+        from .protocol import Pos, distance
+        rockets, other, towers, missiles = {}, set(), [], 0
+        for tower in turn.weapons():
+            cmd = response['roleCommandMap'].get(str(tower.unit_id),{})
+            if cmd.get('action') != 'attack':
+                continue
+            if tower.kind == 'rocket':
+                towers.append(tower.unit_id)
+                missiles += len(cmd['targetPos'])
+            for point in cmd['targetPos']:
+                for uid,damage in raw_damage(turn,tower,Pos.load(point)).items():
+                    if tower.kind == 'rocket':
+                        rockets[uid] = rockets.get(uid,0)+damage
+                    else:
+                        other.add(uid)
+        targets = {r.robot_id:(r.health,rockets[r.robot_id]) for r in turn.robots
+                   if r.robot_id in rockets and r.robot_id not in other and our_target(turn,r)
+                   and not any(e.kind in ('rocket','railgun','gatling') and e.health>0
+                               and distance(e.pos,r.pos)<=e.range_of_attack()+1 for e in turn.enemies)}
+        self.pending_rocket_volley = ({'round':turn.round_no,'towers':towers,
+                                      'missiles':missiles,'targets':targets} if missiles else None)
         self.last_commands = response['roleCommandMap'].copy()
         self.last_roles = {str(r.unit_id): r for r in turn.controllable()}
         self.response = response
